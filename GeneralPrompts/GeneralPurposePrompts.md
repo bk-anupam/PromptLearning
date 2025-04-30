@@ -1,0 +1,3 @@
+1. Is there any app or framework available to manage the numerous prompts that we write for different LLMs and their responses. It becomes quite difficult to track these prompts scattered across different interfaces like chatGPT, claude.ai, gemini, VSCode copilot etc. How can I consolidate my prompts and the responses in a single place.
+2. Based on whatever conversations we have had in the past, how would you describe me as a person.
+3. can you braistorm and suggest ways how can I use my medical records data and RAG to build a helpful AI agent that plays the role of a medical assistant. In what ways could the AI agent be used.
