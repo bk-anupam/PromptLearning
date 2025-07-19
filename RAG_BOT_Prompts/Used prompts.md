@@ -1,3 +1,5 @@
+#rag_bot #RAG 
+
 ## Reranker Prompt: 
 RAG_BOT is  an  agentic RAG system using langgraph and run as a telegram bot with chromadb as vector store.  I am storing the pdf documents in chromadb with date metadata and then trying to query the vectordb using natural language. I have implement reranking mechanism in my RAG pipeline and what I observed was List[str] returned by my  retrieve_context tool becomes a str when accessed via last_message.content in the rerank_context_node. I got an explanation from an LLM about this behaviour. I want to understand how to correctly implement the reranking logic using langgraph if my retrieve_context tool returns a list of documents
 
