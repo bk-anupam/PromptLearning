@@ -39,8 +39,7 @@ It achieves this by maintaining a "running summary" and deciding when to update 
    * First-time Summary: If there is no RunningSummary from a previous turn, the node takes the block of messages that exceeded the token threshold and sends them to the specified model
     using the initial_summary_prompt. This creates the very first summary.
    * Updating an Existing Summary: If a RunningSummary does exist, the node is more efficient. It takes the new block of messages (the ones that just went over the threshold) and the text 
-     of the old summary and sends them to the model using the existing_summary_prompt. This prompt instructs the LLM to integrate the new information into the existing summary, creating an
-     updated, consolidated summary.
+     of the old summary and sends them to the model using the existing_summary_prompt. This prompt instructs the LLM to integrate the new information into the existing summary, creating an updated, consolidated summary.
 
   Step 4: Construct the New, Condensed Message List
 
@@ -65,7 +64,8 @@ It achieves this by maintaining a "running summary" and deciding when to update 
    * model: The LLM used to perform the summarization. You can use a smaller, faster model for this to save costs.
    * max_tokens_before_summary: This is the trigger. It defines how "long" the conversation can get before the node decides to summarize.
    * max_summary_tokens: This is a budgeting parameter. It tells the node how much space to reserve for the summary message when calculating the total token count. To enforce a strict
-     output length, you must bind max_tokens to the model itself (e.g., model.bind(max_tokens=128)).
+     output length, you must bind max_tokens to the model itself. We are doing that in graph_builder.py when instantiation the model to be used for summarization.
+   summarization_model = llm.bind(generation_config={"max_output_tokens": config_instance.MAX_SUMMARY_TOKENS})
    * token_counter: The function used to count tokens. For accuracy, you should pass the LLM's own token counting method (e.g., llm.get_num_tokens_from_messages).
    * input_messages_key vs. output_messages_key: By default, the node reads from "messages" and writes to "summarized_messages". This is a crucial design choice: it preserves the full,
      unabridged history in your checkpointer (messages) while providing a separate, clean, summarized list for your agent to work with (summarized_messages).
@@ -78,7 +78,7 @@ When you create an instance of the node, you configure its behavior. Let's look 
 summarization_node = SummarizationNode(
     token_counter=llm.get_num_tokens_from_messages,
     model=summarization_model,
-    max_tokens=config_instance.MAX_TOKENS_BEFORE_SUMMARY,
+    max_tokens=config_instance.MAX_TOKENS,
     max_tokens_before_summary=config_instance.MAX_TOKENS_BEFORE_SUMMARY,
     max_summary_tokens=config_instance.MAX_SUMMARY_TOKENS,
 )
@@ -86,9 +86,14 @@ summarization_node = SummarizationNode(
 
 - **`model`**: This is the `LanguageModelLike` object (e.g., `ChatGoogleGenerativeAI`) that will be used to generate the actual summary text.
 - **`max_tokens_before_summary`**: This is the **trigger**. The node counts the tokens in the message history. As soon as the count exceeds this value, the summarization process begins.
-- **`max_tokens`**: This is the **budget** for the summarization payload. When summarization is triggered, the node gathers the most recent messages that fit within this token budget and sends _only that slice_ to the summarization model. As we discovered in our previous conversation, setting this value too low can cause the earliest messages (like the user's name) to be excluded from the summary.
+- **`max_tokens`**: Maximum number of tokens to return in the final output. Will be enforced only after summarization. This is the **budget** for the summarization payload. When summarization is triggered, the node gathers the most recent messages that fit within this token budget and sends _only that slice_ to the summarization model. As we discovered in our previous conversation, setting this value too low can cause the earliest messages (like the user's name) to be excluded from the summary.
 - **`max_summary_tokens`**: This is used for internal token budgeting. The node subtracts this value from `max_tokens` to calculate how many tokens are left for the _non-summarized_ part of the conversation. **Crucially**, this parameter also caused the `TypeError` in our previous interaction because `langmem` tries to automatically bind `max_tokens` to the model, which is incompatible with `ChatGoogleGenerativeAI`.
 - **`token_counter`**: A function to count message tokens. Using the model's own counter (`llm.get_num_tokens_from_messages`) is more accurate than the default approximation.
+-  input_messages_key: str = "messages"- Key in the input graph state that contains the list of messages to summarize.
+- output_messages_key: str = "summarized_messages"- Key in the state update that contains the list of updated messages.
+
+SummarizationNode processes the messages from oldest to newest: once the cumulative number of message tokens reaches `max_tokens_before_summary`, all messages within `max_tokens_before_summary` are summarized (excluding the system message, if any)
+and replaced with a new summary message. The resulting list of messages is [summary_message] + remaining_messages.
 
 #### Step 2: Execution within the Graph
 
@@ -109,6 +114,51 @@ This is the core logic where the node decides _if_ and _what_ to summarize.
 3. **Iterate and Count**: It starts iterating through the messages that have _not_ yet been summarized, counting tokens with the `token_counter`.
 4. **Find the Cutoff**: It keeps counting until the token count exceeds the `max_tokens_before_summary` trigger. All messages from the start of the new batch up to this cutoff point are marked as `messages_to_summarize`.
 5. **Handle Tool Calls**: It includes a smart check: if the very last message in the `messages_to_summarize` slice is an `AIMessage` with tool calls, it will also include the subsequent `ToolMessage`s that correspond to those calls. This is critical to avoid sending an incomplete thought to the summarizer.
+
+#### `n_tokens`
+
+- **What it is:** This is a temporary, running counter used inside a loop. It accumulates the token count of new messages one by one, starting from the oldest new message and moving toward the most recent.
+#### `n_tokens_to_summarize`
+
+- **What it is:** This is the final token count of the specific chunk of messages that the function has decided **to summarize**. It's the main output of the decision-making logic.
+- **How it's calculated:** It gets its value only when the summarization condition is met. The logic looks for the perfect split point:
+```python
+# /home/bk_anupam/anaconda3/envs/ml_env/lib/python3.11/site-packages/langmem/short_term/summarization.py
+if (
+    n_tokens >= max_tokens_before_summary
+    and total_n_tokens - n_tokens <= max_remaining_tokens
+    and not should_summarize
+):
+    n_tokens_to_summarize = n_tokens
+    should_summarize = True
+    idx = i
+
+```
+This `if` statement is the core of the logic:
+1. `n_tokens >= max_tokens_before_summary`: "Have we read enough messages to even think about summarizing?"
+2. `total_n_tokens - n_tokens <= max_remaining_tokens`: "If we summarize everything we've read so far (`n_tokens`), will the rest of the new messages (`total_n_tokens - n_tokens`) fit into the space we reserved for recent messages (`max_remaining_tokens`)?"
+When both are true, the function decides to summarize the messages it has counted in `n_tokens`.
+#### `total_n_tokens`
+
+- **What it is:** This variable holds the total token count of all messages that are candidates for being included in the current turn. This excludes any messages that were already part of a previous summary.    
+- **How it's calculated:** It counts the tokens in all messages that come after the last message that was summarized in a previous run.
+#### `max_remaining_tokens`
+
+- **What it is:** This is the token budget reserved for the most recent messages that will **not** be summarized. It's the space on our "page" for the tail end of the conversation that we want to keep in its original form.    
+- **How it's calculated:** It's derived from the total context window size (`max_tokens`) minus the space we need to allocate for the summary message itself (`max_summary_tokens`).
+#### `max_tokens_to_summarize`
+
+- **What it is:** This variable represents the maximum number of tokens that the **summarization model itself** can accept as input. This is essentially the context window of the model being used for the summarization task.
+- **How it's calculated:** It starts as the total context window size (`max_tokens`) and is then reduced by the size of any _existing_ summary, because that existing summary text needs to be included in the prompt to the summarization model.
+#### Summary of How They Work Together
+
+1. The function first determines the budget for messages that will remain after summarization (`max_remaining_tokens`).
+2. It then loops through the new, unprocessed messages, keeping a running count of their size (`n_tokens`).
+3. In each step of the loop, it checks if the accumulated size (`n_tokens`) has passed the trigger threshold (`max_tokens_before_summary`).
+4. If it has, it then performs the crucial check: will the _rest_ of the messages fit within the `max_remaining_tokens` budget?
+5. The first time this is true, it has found the perfect split. The messages it has counted so far are marked for summarization, and their total size is stored in `n_tokens_to_summarize`.
+6. Finally, before sending these messages to the summarizer, it checks if their size (`n_tokens_to_summarize`) exceeds the summarizer model's own context limit (`max_tokens_to_summarize`) and trims them if necessary.
+
 #### 2.3. Prepare Input for the Summarizer LLM (`_prepare_input_to_summarization_model`)
 
 Now that the node has a slice of messages to summarize, it prepares the final prompt for the `summarization_model`.
