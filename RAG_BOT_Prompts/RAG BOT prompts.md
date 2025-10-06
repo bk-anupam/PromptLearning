@@ -466,3 +466,179 @@ You'd need to carefully design the coordination mechanisms between agents. This 
 Your current architecture represents a solid, well-engineered single-agent RAG system that handles many complex scenarios intelligently. The routing logic, hybrid search, and self-correction mechanisms show sophisticated understanding of practical RAG challenges. However, the monolithic design creates scalability and maintainability constraints that a thoughtfully designed multi-agent architecture could address.
 
 The decision to transition should depend on your specific scaling requirements and development resources. If you're primarily serving individual users or small groups, the current architecture may be sufficient. However, if you anticipate significant scaling needs or want to enable more sophisticated concurrent processing, a multi-agent approach could provide substantial benefits. The key is ensuring that any architectural changes solve real problems rather than adding complexity for its own sake.
+
+### Prompt 11:
+The agent stores chroma db files in GCS buckets which it downloads to container filesystem when launching a container. This makes any indexing done via telegram document upload, persist locally in container filesystem but we currently have no mechanism in place to sync those new changes to indexed data back to GCS bucket. This is important feature for the agent. We also need to take into account that murli content retrieved using web search (which happens when local retrieval fails), also needs to be indexed to enhance the agent's knowledgebase. I want to come up with an approach (remember no code for now, only the system design and the implementation approach) for implementing this feature.
+### Response 11:
+#### **Proposed Approach: An Event-Driven Sync Service**
+
+The core idea is to introduce a new, asynchronous "Uploader Service" responsible for the `gsutil rsync` operation. This service will be triggered by two key events within the application:
+
+1. **After a user-uploaded document is indexed:** The `document_handler` will trigger the sync service after successfully indexing a new file.
+2. **After web-retrieved content is indexed:** A new node will be added to the agent's graph. This node's responsibility is to take content retrieved from a web search, format it into a `Document`, index it, and then trigger the sync service.
+
+Additionally, a final "safety net" sync will be initiated upon container shutdown to capture any recent changes.
+
+---
+
+#### **Key Components & Implementation Steps**
+
+#### **1. New Component: `GCSUploaderService`**
+
+- **Location:** A new file, `[RAG_BOT/src/services/gcs_uploader.py](code-assist-path:/home/bk_anupam/code/LLM_agents/RAG_BOT/src/services/gcs_uploader.py "/home/bk_anupam/code/LLM_agents/RAG_BOT/src/services/gcs_uploader.py")`.
+- **Functionality:**
+    - It will contain an `async` method, `sync_vector_store()`.
+    - This method will run the `gsutil -m rsync -r <local_chroma_path> <gcs_bucket_path>` command as an asynchronous subprocess.
+    - It will fetch the local path and GCS bucket URI from the application's central `Config`.
+    - It should include logging to indicate when a sync starts and when it completes (or if it fails).
+    - To prevent race conditions from multiple rapid updates, it should implement a locking mechanism (e.g., `asyncio.Lock`). A sync operation will only start if one is not already in progress.
+
+#### **2. Trigger Point 1: Handling User Document Uploads**
+
+- **File to Modify:** `[RAG_BOT/src/telegram/handlers/document_handler.py](code-assist-path:/home/bk_anupam/code/LLM_agents/RAG_BOT/src/telegram/handlers/document_handler.py "/home/bk_anupam/code/LLM_agents/RAG_BOT/src/telegram/handlers/document_handler.py")`
+- **Logic:**
+    - The existing `handle_document` method already processes and indexes the uploaded file.
+    - After the call to `self.document_indexer.index_file()` completes successfully, a call will be made to the new `GCSUploaderService.sync_vector_store()`.
+    - This ensures that as soon as a user's document is added to the local database, the change is immediately pushed to GCS.
+
+#### **3. Trigger Point 2: Handling Web-Retrieved Content**
+
+This is the more complex part, involving the agent's graph.
+
+- **File to Modify 1:** `[RAG_BOT/src/agent/process_tool_output_node.py](code-assist-path:/home/bk_anupam/code/LLM_agents/RAG_BOT/src/agent/process_tool_output_node.py "/home/bk_anupam/code/LLM_agents/RAG_BOT/src/agent/process_tool_output_node.py")`
+    
+    - **Logic:** When this node processes the output from the Tavily web search tool, it currently just adds the text to the `AgentState`.
+    - **Change:** It will be modified to also convert the raw web content into a Langchain `Document` object. Crucial metadata, such as the source URL and retrieval timestamp, will be added to the `Document`'s metadata. This new `Document` object will be stored in a new field in the `AgentState`, e.g., `docs_to_index`.
+- **File to Modify 2:** `[RAG_BOT/src/agent/graph_builder.py](code-assist-path:/home/bk_anupam/code/LLM_agents/RAG_BOT/src/agent/graph_builder.py "/home/bk_anupam/code/LLM_agents/RAG_BOT/src/agent/graph_builder.py")`
+    
+    - **Logic:** A new node, let's call it `index_and_sync_node`, will be added to the graph.
+    - This node will be placed _after_ the `process_tool_output_node` and before the final response generation.
+    - **Node's Function:**
+        1. It checks if the `state.docs_to_index` field contains any new documents.
+        2. If so, it calls the `vector_store.add_documents()` method to index them.
+        3. After successful indexing, it triggers the `GCSUploaderService.sync_vector_store()`.
+    - This design cleanly separates the agent's reasoning (processing tool output) from the side-effect (indexing and syncing).
+
+#### **4. Shutdown Hook for Data Integrity**
+
+To prevent data loss if the container is terminated before an async sync completes, we'll add a final sync on shutdown.
+
+- **File to Modify:** `[startup.sh](code-assist-path:/home/bk_anupam/code/LLM_agents/startup.sh "/home/bk_anupam/code/LLM_agents/startup.sh")`
+- **Logic:**
+    - A `trap` command will be added to the script to catch the `SIGTERM` signal that Cloud Run sends before shutting down an instance.
+    - The `trap` will execute a simple, synchronous Python script that calls the sync logic one last time.
+    - **Example `trap` command in `[startup.sh](code-assist-path:/home/bk_anupam/code/LLM_agents/startup.sh "/home/bk_anupam/code/LLM_agents/startup.sh")`:**
+        
+        ```bash
+        # Function to run on exit
+        cleanup() {
+            echo "SIGTERM received, running final GCS sync..."
+            python -m RAG_BOT.src.services.gcs_uploader --final-sync
+            echo "Final sync complete."
+        }
+        
+        # Trap SIGTERM and run the cleanup function
+        trap cleanup TERM
+        
+        # Start the main application (Gunicorn)
+        gunicorn -b 0.0.0.0:5000 RAG_BOT.src.telegram.bot:app &
+        
+        # Wait for Gunicorn process to exit
+        wait $!
+        ```
+        
+    - The `[gcs_uploader.py](code-assist-path:/home/bk_anupam/code/LLM_agents/RAG_BOT/src/services/gcs_uploader.py "/home/bk_anupam/code/LLM_agents/RAG_BOT/src/services/gcs_uploader.py")` would be made executable and handle the `--final-sync` argument to run a blocking version of the sync.
+
+#### **Summary of Benefits**
+
+- **Persistent Knowledge:** The agent's knowledge base grows permanently.
+- **Decoupled & Reusable:** The `GCSUploaderService` is a standalone component that can be triggered from anywhere in the application.
+- **Robust:** The combination of event-driven syncs and a final shutdown hook makes the process resilient.
+- **Explicit Graph:** Modifying the LangGraph makes the flow of data and side effects clear and maintainable.
+
+### Prompt 12:
+I want to use two different models in my agent, for handle_question_node I want to use "gemini-2.5-pro" and for the rest I want to use "gemini-2.5-flash". The reason behind this is that handle_question_node is the open responsible for tool calling and I think a more advanced model would be better suited for this purpose. Also I have noticed that the agent is not able to handle follow up questions correctly. Basically not being able to understand if this is a follow-up question based on the previous one. Despite the fact that I am passing the most recent conversation history as context in the prompt. What more can be done to improve this conversation understanding behaviour.
+
+I need your feedback on my observations and suggestions from a system design and architecture perspective. Please don't do any code changes for now, till I explicitly ask you to do code changes.
+
+### Response 12:
+Of course. I'd be happy to provide feedback on your observations and offer some suggestions from a system design and architecture perspective. Your insights are excellent and point toward common and effective patterns for optimizing complex agentic systems.
+
+Let's break down your two main points.
+
+#### 1. Using Different Models for Different Tasks
+
+Your idea to use `gemini-1.5-pro` for the `handle_question_node` (tool-calling) and `gemini-1.5-flash` for the rest of the agent is an outstanding architectural decision. This is a best-practice approach often referred to as a "leader/worker" or "router/executor" model pattern.
+
+#### My Feedback:
+
+- **You are absolutely right.** The `handle_question_node` is the most critical decision point in your RAG pipeline. Its ability to accurately understand the user's intent, parse the conversational context, and correctly decide whether to call a tool (and with what arguments) determines the success of the entire workflow. Using a more powerful model here is a wise investment.
+- **Cost and Performance Optimization:** Your reasoning is spot-on. You gain three significant advantages:
+    1. **Higher Accuracy:** A more capable model like Pro is better at the nuanced reasoning required for tool use, especially with complex or follow-up questions. This reduces errors and improves the reliability of the agent.
+    2. **Lower Latency:** Generation tasks (like the final answer, summarization, or evaluation) are often where the most tokens are produced. Using a faster model like Flash for these steps can significantly decrease the perceived latency for the end-user.
+    3. **Reduced Cost:** Since generation and other "worker" tasks are more frequent and token-intensive, using a more cost-effective model for them will dramatically lower your operational costs without sacrificing the quality of the most critical decision-making step.
+
+#### Architectural Implementation:
+
+From a design perspective, your current architecture in `[graph_builder.py](code-assist-path:/home/bk_anupam/code/LLM_agents/RAG_BOT/src/agent/graph_builder.py "/home/bk_anupam/code/LLM_agents/RAG_BOT/src/agent/graph_builder.py")` can easily accommodate this. The change would involve:
+
+1. Initializing two distinct LLM clients in `[graph_builder.py](code-assist-path:/home/bk_anupam/code/LLM_agents/RAG_BOT/src/agent/graph_builder.py "/home/bk_anupam/code/LLM_agents/RAG_BOT/src/agent/graph_builder.py")`: one for tool-calling (`gemini-1.5-pro`) and one for all other tasks (`gemini-1.5-flash`).
+2. Binding the tools exclusively to the `pro` model.
+3. Passing the appropriate LLM instance to each node as a dependency. For example, `handle_question_node` would receive the `pro` model, while `generate_final_response`, `conversational_node`, `evaluate_context_node`, etc., would receive the `flash` model.
+
+This is a clean, modular change that enhances the system's efficiency and intelligence.
+
+---
+
+#### 2. Improving Follow-up Question Handling
+
+Your observation that the agent struggles with follow-up questions despite having access to conversation history is a classic challenge in RAG systems. While passing message history is a good first step, it often isn't enough because the retrieval system itself is stateless and doesn't understand conversational context.
+
+The root of the problem is that a follow-up question like _"What about its original form?"_ is ambiguous on its own. The retriever has no idea that "its" refers to "the soul" from the previous turn.
+
+Here are some architectural suggestions to significantly improve this behavior, from most impactful to least:
+
+#### Suggestion 1: Implement a "Conversational Query Rewriter" Node (Most Recommended)
+
+This is the most robust and widely adopted architectural pattern for solving this problem.
+
+- **Concept:** Before the agent attempts to retrieve any information, add a new, dedicated node to the graph. The sole purpose of this node is to rewrite the user's (potentially conversational) query into a complete, self-contained question.
+- **Workflow:**
+    1. The user asks a follow-up: `"And what about its original form?"`
+    2. The `router_node` correctly identifies this as a `RAG_QUERY`.
+    3. The flow proceeds to a **new `query_rewriter` node**.
+    4. This node is given the conversation history and the latest user question. It calls an LLM with a specific prompt like: _"Given the chat history, rewrite the user's final question into a standalone question that can be understood without the history. If the question is already standalone, return it unchanged."_
+    5. The LLM returns a rewritten query: `What is the original form of the soul, based on the teachings in the murli?`
+    6. This complete, unambiguous query is then passed to the `handle_question_node` and the rest of the RAG pipeline.
+- **Architectural Benefit:** This decouples the conversational understanding from the retrieval mechanism. Your retriever can remain simple and efficient, as it will always receive a perfect, context-rich query to work with. This is far more reliable than hoping the tool-calling model pieces the context together on the fly.
+
+#### Suggestion 2: Enhance the Summarization Prompt
+
+The summarization process is another point where critical context can be lost. A generic summary might condense "We discussed the soul" but lose the crucial detail that you were talking about the murli from `1969-01-23`.
+
+- **Concept:** Make your summarization process more "entity-centric."
+- **Architectural Tweak:** Modify the summarization prompts in `[prompts.yaml](code-assist-path:/home/bk_anupam/code/LLM_agents/RAG_BOT/src/config/prompts.yaml "/home/bk_anupam/code/LLM_agents/RAG_BOT/src/config/prompts.yaml")` to explicitly instruct the LLM to preserve key information.
+- **Example Prompt Addition:** `"CRITICAL: Your summary MUST preserve all key entities, including specific dates (e.g., 1969-01-23), spiritual terms (e.g., 'soul consciousness', 'karma'), and the core subjects of the user's questions."`
+- **Benefit:** This creates a much richer context "memory" for the agent, making the conversation history more useful for subsequent turns, especially after many interactions.
+
+#### Suggestion 3: More Explicit Prompting in `handle_question_node`
+
+While you are already passing the history, you can be more directive in your prompt.
+
+- **Concept:** Explicitly tell the model _how_ to use the history.
+- **Architectural Tweak:** In `[prompts.py](code-assist-path:/home/bk_anupam/code/LLM_agents/RAG_BOT/src/agent/prompts.py "/home/bk_anupam/code/LLM_agents/RAG_BOT/src/agent/prompts.py")` or `[agent_node.py](code-assist-path:/home/bk_anupam/code/LLM_agents/RAG_BOT/src/agent/agent_node.py "/home/bk_anupam/code/LLM_agents/RAG_BOT/src/agent/agent_node.py")`, when constructing the prompt for `handle_question_node`, frame the history more clearly. Instead of just listing messages, you could prepend a meta-instruction.
+- **Example Prompt Structure:**
+    
+    plaintext
+    
+    `System: [Your base persona...]  Human: --- Start of Recent Conversation History --- User: "What did Baba say about the soul in the murli from 1969-01-23?" AI: "Baba said the soul is a point of light..." --- End of Recent Conversation History ---  Based on the history above, analyze the following new user question and decide which tool to use. New User Question: "What about its original form?"`
+    
+- **Benefit:** This structure more clearly delineates the history from the current task, which can help the model focus its attention. However, this is less robust than the Query Rewriter approach.
+
+#### Summary of Recommendations
+
+1. **Proceed with your plan to use two different models.** It's an excellent design choice.
+2. To fix follow-up questions, **implement the "Conversational Query Rewriter" node.** This is the most effective and architecturally sound solution and will yield the biggest improvement in your agent's conversational abilities.
+3. As a secondary improvement, **enhance your summarization prompts** to be more entity-aware.
+
+I'm ready to help with the code changes for these suggestions whenever you are.
