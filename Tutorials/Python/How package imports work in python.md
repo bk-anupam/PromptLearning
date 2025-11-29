@@ -11,6 +11,16 @@ This full search path is stored in: sys.path
 
 `PYTHONPATH` is a **special environment variable** used by Python to determine **which directories to search** when **importing modules**. `PYTHONPATH` is essentially **prepended** to `sys.path` when Python starts.
 
+ **So when does PYTHONPATH appear?**
+Only when _you_ (or some tooling) explicitly sets it:
+- You exported it manually:    
+    `export PYTHONPATH=/some/path`    
+- A shell script / `.env` file / IDE added it    
+- A container image set it    
+- Some build tool (old Django, ROS, Bazel, etc.) injected it    
+
+If none of those happen, PYTHONPATH remains **unset / empty**.
+
 **How to Set `PYTHONPATH`:**
 export PYTHONPATH=/path/to/my/modules
 
@@ -62,15 +72,19 @@ LLM_agents is the project root directory. The presence of `__init__.py` file in 
 
 #### ~code> python -m llm_agents.main command:
 
-When you use `-m`, Python treats the argument as a module name and runs it as if you had imported it. Here's a breakdown of how `python -m llm_agents.main` works when executed from parent directory of llm_agents:
+When you use `-m`, Python treats the argument as a module name and runs it as if you had imported it. Here's a breakdown of how `python -m llm_agents.main` works when executed from parent directory of llm_agents. A key effect of using `-m` is that Python adds the current working directory (your project root) to the top of its `sys.path`.:
 
-- **Finding the package**: Python treats `llm_agents` as a package, and the parent directory of `project` is added to `sys.path`. Python looks for a package or module named `llm_agents` in the current working directory and in the directories listed in `sys.path`.
+- **Finding the package**: Python treats `llm_agents` as a package, and the parent directory of `project` (LLM_agents) which is the current working directory is added to `sys.path`. Python looks for a package or module named `llm_agents` in the current working directory and in the directories listed in `sys.path`.
 
 - **Importing the package**: Once Python finds the `llm_agents` package, it imports it as a module. This means that the `__init__.py` file in the `llm_agents` directory is executed, and the package's namespace is initialized.
     
 - **Finding the module**: After importing the `project` package, Python looks for a module named `main` within the package. This module is expected to be a Python file named `main.py` in the `llm_agents` directory.
 
-- **Running the module**: Finally, Python runs the `main.py` module as if it had been imported using `import llm_agents.main`. The `if __name__ == "__main__":` block in `main.py` will be executed, and the script will run as expected.
+- **Running the module**: Finally, Python runs the `main.py` module as if it had been imported using `import llm_agents.main`. 
+- `__name__` is a special built-in variable in Python.
+- When a Python file is executed directly (either via `python file.py` or `python -m module`), the interpreter sets `__name__` to the string `"__main__"`.
+- When a file is _imported_ by another file, the interpreter sets `__name__` to the module's path (e.g., when `main.py imports `config.py`, the `__name__` variable inside `config.py` is `"email_assistant.src.config"`).
+- The `if __name__ == "__main__":` block in `main.py` will be executed, and the script will run as expected.
 
 For importing other modules within the same package (or subpackages) you should use relative imports or absolute imports from the top-level package. 
 
