@@ -321,48 +321,68 @@ This is a common point of confusion. **By default, `asyncio` tasks run concur
     - `asyncio` provides **concurrency**: multiple tasks can make progress in overlapping time periods.
     - It does _not_ provide **parallelism** (simultaneous execution on multiple CPU cores) by itself for Python code. Python's Global Interpreter Lock (GIL) generally restricts true parallelism for threads running Python bytecode.
 - **When to use threads/processes with `asyncio`**: If you have CPU-bound code (e.g., complex calculations) that would block the single-threaded event loop for too long, you should run that code in a separate thread pool (using `loop.run_in_executor()`) or a separate process pool. This offloads the blocking work, allowing the event loop to remain responsive for other I/O-bound tasks.
-#### **Async context managers**
 
+#### How Python actually handles CPU-bound tasks in async based systems
+
+ **Option 1 — Thread pool**
 ```python
-# Create server parameters for stdio connection
-import asyncio
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+await asyncio.to_thread(cpu_heavy_function)
+```
+Good for medium CPU tasks (image processing, PDF parsing, encryption).
 
-from langchain_mcp_adapters.tools import load_mcp_tools
-from langgraph.prebuilt import create_react_agent
+**Option 2 — Process Pool**
+```python
+await loop.run_in_executor(ProcessPoolExecutor(), cpu_heavy_function)
+```
+Good for heavy CPU tasks (ML inference on CPU, large computations).
 
-server_params = StdioServerParameters(
-    command="python",
-    # Make sure to update to the full absolute path to your math_server.py file
-    args=["/home/bk_anupam/code/LLM_agents/LANGGRAPH_PG/demo_mcp_server.py"],
-)
+**Option 3 — Let GPU handle it**
+Inside async code, for PyTorch:
+```python
+await asyncio.to_thread(model.forward, x)
+```
+The CPU scheduling happens in a thread; GPU kernel runs asynchronously.
 
-async def main():
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            # Initialize the connection
-            await session.initialize()
+#### When you `await`, the awaited code is *always* one of two things:
 
-            # Get tools
-            tools = await load_mcp_tools(session)
+**Case A — I/O-bound async operation**
 
-            # Create and run the agent
-            agent = create_react_agent("openai:gpt-4.1", tools)
-            agent_response = await agent.ainvoke({"messages": "what's (3 + 5) x 12?"})
-
-asyncio.run(main())
+This is what `asyncio` is designed for.
+Example:
+```python
+await asyncio.sleep(1)
+await http_client.get(url)
+await db.fetch(...)
 ```
 
-1. **`async with stdio_client(server_params) as (read, write):`**
-    
-    - The `async with` statement is the asynchronous version of the regular `with` statement. It's used for **asynchronous context managers**.
-    - An asynchronous context manager is an object that defines two special methods: `async def __aenter__(self)` and `async def __aexit__(self, exc_type, exc_val, exc_tb)`.
-    - The `async` in `async with` signals that the `__aenter__` method (when entering the block) and the `__aexit__` method (when exiting the block) are themselves coroutines and must be `await`ed by the event loop.
-    - So, `stdio_client(...)` returns an asynchronous context manager. When the `async with` block is entered, its `__aenter__` coroutine is run (and awaited). When the block is exited, its `__aexit__` coroutine is run (and awaited).
-    
-2. **`async with ClientSession(read, write) as session:`**
-    
-    - This is identical in principle to the `async with stdio_client(...)`. `ClientSession(...)` also returns an asynchronous context manager, and its `__aenter__` and `__aexit__` methods are coroutines that will be awaited.
-    
+These operations:
 
+* *don’t need the CPU* while waiting
+* release control to the event loop
+* let other tasks run meanwhile
+
+➡️ **This is the ideal async case.**
+The coroutine pauses until the I/O is ready, then resumes.
+
+**Case B — A background thread/process running CPU-bound code**
+
+When you do:
+```python
+await asyncio.to_thread(cpu_heavy_function)
+```
+
+Or:
+```python
+await loop.run_in_executor(None, cpu_heavy_function)
+```
+
+What’s happening?
+
+* You *kick CPU-bound code off* into a thread
+* That thread does the heavy work
+* Meanwhile your coroutine **yields control**
+* Event loop stays responsive
+* When the CPU-bound task finishes, the coroutine resumes
+
+➡️ You are *not awaiting CPU-bound code directly*.
+You are awaiting a **future** representing a thread doing CPU-bound work.
