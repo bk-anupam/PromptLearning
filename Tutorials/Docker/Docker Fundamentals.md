@@ -850,3 +850,243 @@ docker volume create --driver local \
   --opt device=:/docker/example \
   my_nfs_volume
 ```
+
+## HEALTHCHECK:
+In Docker, a **`HEALTHCHECK`** is an instruction used in a Dockerfile (or a parameter in a Compose file) that tells the Docker engine how to test a container to check if it is still working correctly.1
+
+While Docker naturally monitors if a process is "running," the `HEALTHCHECK` command allows Docker to monitor if the process is actually **functional**.
+
+### 1. How it Works
+
+By default, Docker only checks if the main process (PID 1) inside the container is alive. However, a web server might be "running" but stuck in an infinite loop or unable to connect to a database, rendering it useless.
+
+When you define a `HEALTHCHECK`, the container gains a **health status** in addition to its running status:2
+
+- **Starting:** The container is booting up.3    
+- **Healthy:** The check command returned success.4
+- **Unhealthy:** The check command failed after a certain number of attempts.
+    
+### The Syntax
+
+A typical health check looks like this in a Dockerfile:
+
+Dockerfile
+
+```
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+  CMD curl -f http://localhost/ || exit 1
+```
+
+- **Interval:** How often to run the check.    
+- **Timeout:** How long to wait for a response before considering it a failure.    
+- **Retries:** How many consecutive failures are needed to mark it "unhealthy."
+    
+### 2. What Purpose Does it Serve?
+
+The primary goal is **automated reliability**. It provides a "signal" to the systems managing your containers so they can take action without human intervention.
+
+- **Self-Healing:** Orchestrators like Docker Swarm or Kubernetes use this status to kill "unhealthy" containers and spin up new ones.5    
+- **Zero-Downtime Deploys:** During an update, Docker can wait until the new version is "healthy" before shutting down the old version.    
+- **Dependency Management:** If you use Docker Compose, you can prevent "Service B" from starting until "Service A" reports as healthy.
+    
+### 3. When to Use It
+
+You should implement a `HEALTHCHECK` in the following scenarios:
+
+|**Scenario**|**Why it's needed**|
+|---|---|
+|**Web Servers/APIs**|To ensure the server is actually responding to HTTP requests, not just holding a port open.|
+|**Database Services**|To verify the database engine is ready to accept connections after its internal initialization.|
+|**Long-running Daemons**|To detect "silent deaths" where the process is alive but stuck or deadlocked.|
+|**Complex Startup Apps**|For apps that take 30+ seconds to boot; it prevents traffic from hitting the container too early.|
+
+### When to Avoid It
+
+- **Short-lived tasks:** Don't use it for "one-off" containers or batch scripts that run and then exit.    
+- **High-frequency checks:** Avoid very aggressive intervals (e.g., every 1 second) as the check itself consumes CPU and memory resources.
+
+#### Example: Docker Compose Integration
+
+If you have a web app that depends on a database, you can use the health status to ensure the database is "ready" rather than just "started":
+
+YAML
+
+```
+services:
+  db:
+    image: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  web:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy # Only starts 'web' when 'db' is healthy
+```
+
+### 1. The Two Roles of the Health Check
+
+The 10-second interval serves two different purposes depending on where the container is in its lifecycle:
+### A. The "Wait" Phase (Startup)
+
+When you run `docker compose up`, Docker looks at your `depends_on` condition.
+
+- The `web` service will sit in a "Waiting" state.    
+- Every **10 seconds**, Docker runs the check on the `db` container.    
+- As soon as the command succeeds (exits with code 0), the `db` is marked **healthy**.    
+- Only then does Docker trigger the start of the `web` container.
+### B. The "Monitor" Phase (Runtime)
+
+After everything is up and running, the check **does not stop**.
+
+- Every **10 seconds**, Docker continues to run that command.
+- If the database suddenly crashes or becomes unresponsive later that day, the health check will fail.
+- After **5 retries** (as defined in the example), the status will flip from **healthy** to **unhealthy**.
+
+### 2. What happens if it becomes "Unhealthy" later?
+
+This is where the behavior depends on your environment:
+
+- **Standard Docker Compose:** By default, Docker Compose **does not** automatically restart a container just because it became unhealthy. It will simply show `(unhealthy)` when you run `docker ps`. You would need a tool like **Autoheal** to force a restart.
+    
+- **Docker Swarm / Kubernetes:** These orchestrators will see the "unhealthy" status and automatically kill the container and start a fresh one to restore service.
+
+### 3. Important: The "Start Period"
+
+If your database takes a long time to initialize (e.g., 60 seconds), you might want to add a `start_period`.
+
+YAML
+
+```
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s # <--- New!
+```
+
+Why use this?
+
+Without a start_period, the first few failures during the boot-up count toward your 5 retries. If the DB takes 60 seconds to start, it might be marked "unhealthy" before it even has a chance to finish its internal setup. The start_period tells Docker: "Ignore failures for the first 60 seconds, but if it succeeds earlier, mark it healthy immediately."
+
+---
+# Kubernetes probes:
+
+In simple terms, Docker's `HEALTHCHECK` is a **one-size-fits-all** signal, while Kubernetes breaks health down into **specific roles** to handle different failures more intelligently.
+
+If you use Kubernetes, the Docker `HEALTHCHECK` in your Dockerfile is actually **ignored**. You must define these probes in your Kubernetes YAML file instead.
+
+## 1. The Core Differences
+
+Think of Docker's health check as a single "check engine" light. Kubernetes gives you a dashboard with separate lights for "Is the engine on?", "Is the car ready to drive?", and "Is the engine stuck?"
+
+| **Feature**         | **Docker HEALTHCHECK**                                           | **K8s Liveness & Readiness**                           |
+| ------------------- | ---------------------------------------------------------------- | ------------------------------------------------------ |
+| **Granularity**     | Single status (Healthy/Unhealthy).                               | Multiple distinct probes for different states.         |
+| **Action**          | Typically just reports status (needs external tools to restart). | Automated: Restarts pods or reroutes traffic.          |
+| **Traffic Control** | None (traffic flows if the container is "Running").              | **Readiness Probe** prevents users from seeing errors. |
+| **Scope**           | Local to the container/host.                                     | Cluster-wide (managed by the Control Plane).           |
+
+## 2. What are the Kubernetes Probes?
+
+Kubernetes uses three types of "Probes" to manage a container's life.1
+### **Readiness Probe** ("Can I send users here?")
+
+This determines if the container is ready to **accept network traffic**.2
+- **Purpose:** To prevent "502 Bad Gateway" errors while an app is starting up or temporarily overloaded.
+- **On Failure:** Kubernetes removes the Pod from the Service's Load Balancer. The Pod stays running, but no traffic reaches it.3    
+- **Use when:** Your app needs to load a large database, warm up a cache, or if it should stop receiving requests if a backend dependency goes down.    
+### **Liveness Probe** ("Is it dead/stuck?")
+
+This determines if the container is **still running correctly**.4
+- **Purpose:** To catch "zombie" processes—apps that are running but "stuck" (e.g., a deadlock or an infinite loop).
+- **On Failure:** Kubernetes **kills the container and restarts it** based on your restart policy.5    
+- **Use when:** Your application might hang or crash in a way that only a restart can fix.
+### **Startup Probe** ("Is it still booting?")
+
+A newer addition (K8s 1.16+) specifically for apps that take a long time to start.
+- **Purpose:** It "mutes" the Liveness and Readiness probes until the app has finished its initial boot.    
+- **On Failure:** Restarts the container.6    
+- **Use when:** Your app takes 2 minutes to start, but you want a 10-second Liveness check once it’s actually running.
+
+## 3. When to use which?
+
+Most production applications should use **both** Liveness and Readiness probes.
+
+| **If your app is...**       | **Use Readiness** | **Use Liveness** |
+| --------------------------- | ----------------- | ---------------- |
+| Loading a 5GB cache on boot | ✅                 | ❌ (Use Startup)  |
+| Connecting to a DB          | ✅                 | ❌                |
+| Prone to deadlocks          | ❌                 | ✅                |
+| Just a simple web server    | ✅                 | ✅                |
+
+### Pro-Tip: Don't let Liveness depend on external services
+
+A common mistake is making your **Liveness Probe** check if the database is up.
+
+- **The Disaster:** If your database goes down for 5 minutes, **every single one** of your app pods will fail their liveness check.
+- **The Result:** Kubernetes will enter a "death spiral," constantly killing and restarting your apps while the DB is down, which adds massive CPU load and makes recovery harder.
+- **Correct way:** Use the **Readiness Probe** to check the database. That way, the apps stay alive (avoiding the restart loop) but stop receiving traffic until the DB is back.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-api-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: my-api
+  template:
+    metadata:
+      labels:
+        app: my-api
+    spec:
+      containers:
+      - name: api-container
+        image: my-registry/my-api:v1.0
+        ports:
+        - containerPort: 8080
+        
+        # 1. STARTUP PROBE: Handles the slow boot-up
+        # Gives the app 60 seconds (12 * 5s) to start before Liveness takes over.
+        startupProbe:
+          httpGet:
+            path: /health/startup
+            port: 8080
+          failureThreshold: 12
+          periodSeconds: 5
+
+        # 2. READINESS PROBE: Controls traffic flow
+        # Checks if the app can reach the DB. If this fails, the Pod is removed 
+        # from the Load Balancer, but NOT restarted.
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+
+        # 3. LIVENESS PROBE: Handles process freezes
+        # Only checks if the internal server is responding. 
+        # If this fails, Kubernetes kills and restarts the Pod.
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 20
+```
+
+| Field | Purpose | Recommendation |
+| --- | --- | --- |
+| `initialDelaySeconds` | How long to wait after container start before checking. | Set to 0 if using a `startupProbe`. |
+| `periodSeconds` | How often to perform the check. | 10s is standard; 20s-30s for liveness to save CPU. |
+| `timeoutSeconds` | How long to wait for the probe to respond. | Keep low (1s-3s). Probes should be fast. |
+| `failureThreshold` | How many times to fail before taking action. | Usually 3. For startup probes, set this high. |

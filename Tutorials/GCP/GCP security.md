@@ -86,3 +86,24 @@ export GOOGLE_APPLICATION_CREDENTIALS="/home/bk_anupam/google-cloud-sdk/ardent-j
 
 This ensures whenever code is run locally, if we need to authenticate to google cloud, the ADC uses the service account private key to authenticate and the code executes with the privileges granted to the service account.
 
+### How service account authentication works on google cloud run:
+
+Your understanding of ADC is correct, and your question touches on a key architectural difference in how Google Cloud handles service account authentication.cloud.google+1​
+
+#### No Private Keys on Cloud Resources
+
+When code runs on Google Cloud services like Cloud Run or Compute Engine, **it does not have access to the private key at all**. Google Cloud uses a completely different authentication mechanism that eliminates the need for private keys in these environments.[alexanderhose](https://alexanderhose.com/understanding-the-gcp-metadata-service-and-service-accounts/)​
+#### Metadata Server Authentication
+
+Google Cloud resources authenticate through the **metadata server**, an internal HTTP endpoint available at `169.254.169.254` or `metadata.google.internal`. Here's how it works:[alexanderhose](https://alexanderhose.com/understanding-the-gcp-metadata-service-and-service-accounts/)​
+- Your application makes a request to the metadata server asking for an access tokencloud.google+1​    
+- The metadata server verifies the request is coming from the legitimate compute resource    
+- It returns a **short-lived access token** (typically valid for 1 hour) for the attached service account[alexanderhose](https://alexanderhose.com/understanding-the-gcp-metadata-service-and-service-accounts/)​    
+- Your application uses this token to authenticate with Google Cloud APIs    
+
+The Google Cloud client libraries handle this automatically through ADC. When no `GOOGLE_APPLICATION_CREDENTIALS` is set and the code detects it's running on GCP infrastructure, it automatically queries the metadata server for tokens.cloud.google+2​
+#### Key Security Advantage
+
+This architecture means **private keys never exist on the compute resources**. Google's infrastructure manages the cryptographic operations internally, so even if your Cloud Run instance is compromised, there's no long-lived credential to steal. The tokens are short-lived and automatically rotated.[alexanderhose](https://alexanderhose.com/understanding-the-gcp-metadata-service-and-service-accounts/)​
+
+This is why the recommendation is to always use attached service accounts on GCP resources rather than mounting JSON key files, even when deploying to the cloud.
