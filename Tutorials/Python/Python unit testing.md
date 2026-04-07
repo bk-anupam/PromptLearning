@@ -1,4 +1,3 @@
-
 **The code to test:**
 
 ```python
@@ -120,7 +119,6 @@ class TestMedicalProfileDB(unittest.TestCase):
 
 ```
 
-
 I’ll explain this in two parts:
 
 1. **Core concepts of Python unit testing (unittest, MagicMock, patch, setUp, return_value)** using _your code as context_
@@ -132,12 +130,11 @@ No sugar-coating: unit testing is not about checking Firestore works — it’s 
 
 ---
 
-# Part 1: Core Concepts 
+# Part 1: Core Concepts
 
 ## 1. What is Unit Testing?
 
-A **unit test** checks one small unit of behavior in isolation.
-Here, the unit is:
+A **unit test** checks one small unit of behavior in isolation. Here, the unit is:
 
 ```python
 DBClient.save_medical_profile(profile)
@@ -150,14 +147,16 @@ We want to verify:
 ❌ It does NOT really talk to Firestore
 
 Why? Because:
+
 - Firestore is slow
 - Firestore costs money
-- Firestore can fail    
+- Firestore can fail
 - Tests should be fast and deterministic
 
 So we **mock Firestore**.
 
 ---
+
 ## 2. `unittest.TestCase`
 
 ```python
@@ -169,17 +168,19 @@ This:
 - Groups related tests
 - Gives you assertion methods like:
     - `assertEqual`
-    - `assert_called_with`        
-    - `assertTrue`        
+    - `assert_called_with`
+    - `assertTrue`
 
 Each method starting with `test_` is a test case.
 
 ---
+
 ## 3. `setUp()` – test initialization
 
 The `setUp` method runs before each test method in your test class. It's where you prepare the testing environment so each test starts fresh. This is important because you want your tests to be independent—one test's results shouldn't affect another.
 
 In your example, `setUp` does several important things:
+
 ```python
 @patch('src.db.firestore.firestore.client')
 @patch('src.db.firestore.StorageClient')
@@ -191,9 +192,10 @@ def setUp(self, mock_storage_client, mock_firestore_client):
 
 First, it creates a `MagicMock` object and stores it as `self.mock_db`. Then it sets the `return_value` of `mock_firestore_client` to this mock. The `return_value` attribute tells the mock what to return when it's called as a function. Since `firestore.client()` is called in `DBClient.__init__`, this ensures that when your `DBClient` is created, instead of getting a real Firestore client, it gets your controlled mock object.
 
-Finally, it creates an instance of the actual `DBClient` class you're testing. At this point, the patches are active, so the `DBClient` receives mocked dependencies instead of real ones.    
+Finally, it creates an instance of the actual `DBClient` class you're testing. At this point, the patches are active, so the `DBClient` receives mocked dependencies instead of real ones.
 
 ---
+
 ## 4. `patch` – replacing real objects with fake ones
 
 ```python
@@ -227,13 +229,16 @@ The string you pass to `patch` is the full import path to what you want to repla
 When you use `@patch` as a decorator on a method, it passes the mock object as an argument to that method. The patches are applied in reverse order, so the bottom decorator's mock is passed as the first argument. That's why `setUp` receives `mock_storage_client` first, then `mock_firestore_client`.
 
 ---
+
 ## 5. `MagicMock`
 
 ```python
 self.mock_db = MagicMock()
 mock_firestore_client.return_value = self.mock_db
 ```
+
 Now:
+
 ```python
 firestore.client()  →  self.mock_db
 ```
@@ -246,6 +251,7 @@ And `MagicMock` can:
 - Be chained
 
 For example:
+
 ```python
 self.mock_db.collection().document().collection().document().set()
 ```
@@ -268,11 +274,159 @@ Meaning:
 
 So instead of a real DB connection, you get a fake one.
 
+`return_value` is also the key to a more advanced and commonly misunderstood scenario: when your production code doesn't just call a function, but instantiates a class. The next section covers this in depth, because it's a distinction that trips up almost every developer writing mocks for the first time.
+
+---
+
+## 7. Deep Dive: Class Patching and `return_value` — Mock Class vs Mock Instance
+
+This is one of the most important distinctions in Python mocking, and one of the most common sources of confusing bugs. Once it clicks, a whole category of mysterious test failures becomes immediately obvious.
+
+### The Core Concept: Factory vs Product
+
+When your production code instantiates a class — like `DBClient()` or `StorageClient()` — it is calling the class as a constructor. This means `@patch` needs to intercept not just a function call, but a class instantiation. The mock that `@patch` injects represents the **class itself** (the factory), not the object it produces (the product).
+
+Think of it like a vending machine. The mock `@patch` gives you is the vending machine. But when your code puts money in (i.e., calls `DBClient()`), it receives a can from the machine. That can — the actual object your code holds and uses — is stored in `.return_value`. If you want to control what comes out of the machine, you configure `.return_value`.
+
+There are three layers to keep straight:
+
+**The Mock Class** is the object injected by `@patch` into your test function. It represents the class definition itself — the constructor. When your production code calls `DBClient()`, it is effectively calling `MockDB()`.
+
+**The Instantiation** is that constructor call. `MockDB()` is a callable, and calling any `MagicMock` returns another `MagicMock` by default.
+
+**The Mock Instance** is what that call returns — the object that lives inside your production code as `self.db_client`. It is automatically created and stored at `MockDB.return_value`. This is the actual object your production code holds, calls methods on, and passes data to.
+
+```
+@patch injects:  MockDB           ← The Class (the factory)
+Your code calls: MockDB()         ← The Instantiation
+Your code uses:  MockDB.return_value ← The Instance (the product)
+```
+
+### A Concrete Example with `IngestionNodes`
+
+Imagine you have a higher-level orchestration class that internally creates a `DBClient`:
+
+```python
+# src/agents/ingestion/nodes.py
+
+class IngestionNodes:
+    def __init__(self):
+        # This line calls DBClient() — it instantiates the class
+        # The resulting object (the instance) is assigned to self.db_client
+        self.db_client = DBClient()
+
+    def run_ingestion(self, record_id: str, data: dict):
+        # All database interactions happen on the INSTANCE (self.db_client),
+        # not on the DBClient class itself
+        self.db_client.create_record(record_id, data)
+        self.db_client.mark_record_complete(record_id)
+```
+
+Now when you write an integration test for `IngestionNodes`, you want to patch `DBClient` entirely so no real database connection is made. Here's how that looks, and — critically — why each line is written the way it is:
+
+```python
+# tests/integration/test_ingestion_mock.py
+
+@patch('src.agents.ingestion.nodes.DBClient')  # Patch WHERE it's used, not where it's defined
+def test_ingestion_flow_mock(self, MockDB):
+    # At this point, MockDB IS the class mock — the factory.
+    # Your production code hasn't run yet, so no instance exists yet.
+
+    # Step 1: Reach into the future.
+    # We know that when IngestionNodes() is created, it will call DBClient(),
+    # which is now MockDB(). The object it returns is pre-stored at .return_value.
+    # We grab a reference to it NOW, before IngestionNodes even runs.
+    mock_db_instance = MockDB.return_value
+
+    # Step 2: Configure the instance's behavior.
+    # We're saying: when production code calls .create_record() on the instance,
+    # return None (simulate a successful, quiet write with no return value).
+    mock_db_instance.create_record.return_value = None
+    mock_db_instance.mark_record_complete.return_value = None
+
+    # Step 3: Run the real production code.
+    # Internally, this calls DBClient() → which is now MockDB() → which returns mock_db_instance.
+    # So self.db_client inside IngestionNodes IS mock_db_instance.
+    processor = IngestionNodes()
+    processor.run_ingestion("rec_001", {"patient": "Alice"})
+
+    # Step 4: Assert on the INSTANCE, not the class.
+    # The methods were called on the instance (self.db_client), so we verify on mock_db_instance.
+    mock_db_instance.create_record.assert_called_once_with("rec_001", {"patient": "Alice"})
+    mock_db_instance.mark_record_complete.assert_called_once_with("rec_001")
+```
+
+### The Common Pitfall: Configuring the Class Instead of the Instance
+
+The most frequent mistake is forgetting `.return_value` and configuring methods directly on the class mock:
+
+```python
+# ❌ WRONG — This configures a method on the CLASS MOCK (MockDB),
+# as if create_record were a static or class method.
+MockDB.create_record.return_value = "success"
+
+# Your production code calls self.db_client.create_record(...)
+# which is MockDB.return_value.create_record(...)
+# NOT MockDB.create_record(...).
+# So this configuration is completely ignored.
+```
+
+The error is subtle because it doesn't raise an exception — the mock simply doesn't behave the way you intended, and assertions on the instance will silently fail. The rule to remember is: **your code uses the instance, so you must configure and assert on the instance**.
+
+```python
+# ✅ CORRECT — Configure and assert on .return_value (the instance)
+mock_db_instance = MockDB.return_value
+mock_db_instance.create_record.return_value = "success"
+# Now, when production code calls self.db_client.create_record(), it gets "success"
+```
+
+### How This Connects to Your Existing `setUp`
+
+You've already seen this pattern at work in your `TestMedicalProfileDB` setUp — it's just applied at a slightly different level. In `setUp`, you're patching `firestore.client` (a function, not a class), so `mock_firestore_client.return_value` is the object returned by calling that function. The logic is identical: the mock is the callable, and `.return_value` is what calling it produces.
+
+```python
+@patch('src.db.firestore.firestore.client')   # patch the firestore.client FUNCTION
+@patch('src.db.firestore.StorageClient')       # patch the StorageClient CLASS
+def setUp(self, mock_storage_client, mock_firestore_client):
+    self.mock_db = MagicMock()
+
+    # firestore.client() is called inside DBClient.__init__
+    # So we set what it returns — the fake db connection
+    mock_firestore_client.return_value = self.mock_db
+
+    # For StorageClient, we don't configure .return_value explicitly here,
+    # because we don't need to control what StorageClient() returns in these tests.
+    # MagicMock handles it automatically.
+
+    self.db_client = DBClient()
+    # At this point, self.db_client.db IS self.mock_db
+```
+
+The same mental model applies whether you're patching a standalone function or a class constructor. The mock is the callable. `.return_value` is what the callable produces. Your production code uses the product, so that's where your configuration and assertions belong.
+
+### Visual Summary
+
+```
+Scenario: Production code does self.db_client = DBClient()
+
+After @patch('...DBClient') injects MockDB:
+
+    MockDB                         ← what @patch gives your test
+    ├── MockDB()                   ← what your production code calls
+    └── MockDB.return_value        ← what your production code RECEIVES and USES
+         ├── .create_record(...)   ← configure and assert HERE
+         └── .mark_record_complete(...)
+
+❌ MockDB.create_record            ← wrong level, ignored by production code
+✅ MockDB.return_value.create_record ← correct level, matches production code
+```
+
 ---
 
 # Part 2: How `test_save_medical_profile` works
 
 Now the real meat 🍖
+
 ## Step 1: Arrange – create test data
 
 ```python
@@ -283,10 +437,10 @@ profile = MedicalProfile(
 )
 ```
 
-This is **input data** for the method under test.
-You are simulating a real medical profile object.
+This is **input data** for the method under test. You are simulating a real medical profile object.
 
 ---
+
 ## Step 2: Mock the Firestore call chain
 
 Firestore code in production:
@@ -328,7 +482,7 @@ When you use `MagicMock`, every attribute or method you access is automatically
 - **`self.mock_db.collection`**: This is the mock object representing the `collection` **method** itself.
 - **`self.mock_db.collection.return_value`** (The 1st `return_value`): When the real code calls `db.collection("users")`, it gets an object back. In the testing world, `return_value` is that object.
     - **Represents:** The `CollectionReference` (e.g., the "users" collection object).
-- **`self.mock_db.collection.return_value.document`**: Now that we have the CollectionReference mock, we access its `.document` **method**.    
+- **`self.mock_db.collection.return_value.document`**: Now that we have the CollectionReference mock, we access its `.document` **method**.
 - **`self.mock_db.collection.return_value.document.return_value`** (The 2nd `return_value`): When the real code calls `.document("user_id")` on the collection, it gets a document object back.
     - **Represents:** The `DocumentReference` (e.g., the specific user's document).
 
@@ -397,6 +551,7 @@ self.mock_db
      .document                 <-- THE METHOD (Assert here!)
      .return_value             <-- 'mock_user_doc' (The Result)
 ```
+
 ---
 
 ### ✅ Assert correct data was saved
@@ -460,19 +615,19 @@ And that’s exactly how unit tests should behave.
 
 Without mocking, your test would:
 
-- Need Firebase credentials    
-- Fail if internet is down    
+- Need Firebase credentials
+- Fail if internet is down
 - Be slow
 - Be flaky
 - Cost money
-    
+
 With mocking:
 
 - Test runs in milliseconds
-- Fully isolated    
-- Deterministic    
+- Fully isolated
+- Deterministic
 - CI/CD friendly
-    
+
 This is professional-grade testing.
 
 ---
@@ -486,6 +641,415 @@ This test follows the classic pattern:
 1. Arrange: build profile + mocks
 2. Act: call `save_medical_profile`
 3. Assert: check path and data
-    
+
 If any future change breaks the contract, the test catches it immediately.
 
+---
+
+# 🧠 What is a pytest fixture?
+
+A fixture in pytest is:
+
+> A **reusable setup function** that provides data, objects, or state to your tests.
+
+Instead of manually creating things inside every test, you define them once and **inject them where needed**.
+
+
+# ⚙️ Basic example (this is the core idea)
+
+### Without fixture ❌
+
+```python
+def test_user_creation():
+    db = Database()
+    user = db.create_user("Anupam")
+    assert user.name == "Anupam"
+
+def test_user_deletion():
+    db = Database()
+    user = db.create_user("Anupam")
+    db.delete_user(user.id)
+    assert db.get_user(user.id) is None
+```
+
+👉 Repetition everywhere.
+
+
+### With fixture ✅
+
+```python
+import pytest
+
+@pytest.fixture
+def db():
+    return Database()
+```
+
+Now use it:
+
+```python
+def test_user_creation(db):
+    user = db.create_user("Anupam")
+    assert user.name == "Anupam"
+
+def test_user_deletion(db):
+    user = db.create_user("Anupam")
+    db.delete_user(user.id)
+    assert db.get_user(user.id) is None
+```
+
+👉 pytest automatically **injects `db` into your test**
+
+
+# 🤯 Key idea (this is the magic)
+
+You don’t call fixtures.
+
+You just **declare them as function arguments**, and pytest wires everything up.
+
+
+# 🔁 Why fixtures are used (real reasons)
+
+## 1. Eliminate duplication
+
+Instead of rewriting setup logic:
+
+* DB connections
+* API clients
+* mock objects
+
+👉 Define once, reuse everywhere
+
+
+## 2. Centralized setup & teardown
+
+Fixtures can also clean up after themselves:
+
+```python
+@pytest.fixture
+def db():
+    db = Database()
+    yield db
+    db.close()
+```
+
+👉 Everything after `yield` is teardown
+
+
+## 3. Dependency injection (this is the deeper concept)
+
+Fixtures can depend on other fixtures:
+
+```python
+@pytest.fixture
+def db():
+    return Database()
+
+@pytest.fixture
+def user(db):
+    return db.create_user("Anupam")
+```
+
+👉 Now tests can just use `user`, and pytest builds the dependency chain automatically.
+
+
+## 4. Configurable test environments
+
+You can switch behavior easily:
+
+* mock DB vs real DB
+* emulator vs cloud
+* test config vs prod config
+
+👉 This ties directly into your Firebase testing strategy.
+
+
+# 🧩 Fixture scopes (very important)
+
+Fixtures can run at different levels:
+
+| Scope                | Runs when         |
+| -------------------- | ----------------- |
+| `function` (default) | every test        |
+| `class`              | once per class    |
+| `module`             | once per file     |
+| `session`            | once per test run |
+
+---
+
+### Example:
+
+```python
+@pytest.fixture(scope="session")
+def db():
+    return Database()
+```
+
+👉 One DB for entire test suite → faster
+
+
+# 🔥 Real-world example (your use case)
+
+Given your setup (mock / emulator / cloud), you might have:
+
+```python
+@pytest.fixture
+def db_client():
+    if os.getenv("USE_MOCKS") == "true":
+        return MockDBClient()
+    else:
+        return RealDBClient()
+```
+
+👉 Now all tests automatically adapt based on environment.
+
+
+# 🧠 Mental model (keep this)
+
+Think of fixtures as:
+
+> “Plug-and-play test dependencies with lifecycle management”
+
+
+# 💡 When you should use fixtures
+
+Use fixtures when you have:
+
+* shared setup (DB, API, config)
+* expensive initialization
+* reusable test objects
+* environment switching logic
+
+
+# 🚀 Why fixtures matter (big picture)
+
+Without fixtures:
+
+* messy tests
+* duplicated setup
+* hard to maintain
+
+With fixtures:
+
+* clean tests
+* modular design
+* scalable testing
+
+
+# 💯 Bottom line
+
+A pytest fixture is:
+
+> A clean way to **inject reusable setup + manage lifecycle + compose dependencies**
+
+
+---
+
+# 🧠 Why `yield` exists in fixtures
+
+A fixture has two jobs:
+
+1. **Setup** → create resources
+2. **Teardown** → clean them up
+
+The problem is:
+
+> How do you return a value to the test *and* still run cleanup afterward?
+
+That’s exactly why `yield` exists.
+
+# ⚙️ Basic structure
+
+```python
+@pytest.fixture
+def resource():
+    # SETUP
+    r = create_resource()
+
+    yield r   # ← hand it to the test
+
+    # TEARDOWN
+    cleanup_resource(r)
+```
+
+# 🔥 Key idea
+
+> `yield` **pauses** the fixture, gives control to the test, and then resumes after the test finishes.
+
+# 🧭 Execution sequence (step-by-step)
+
+Let’s say you have:
+
+```python
+@pytest.fixture
+def db():
+    print("setup db")
+    db = Database()
+
+    yield db
+
+    print("teardown db")
+    db.close()
+
+
+def test_something(db):
+    print("running test")
+```
+
+## 🧵 What actually happens internally
+
+### Step 1 — pytest prepares the test
+
+It sees:
+
+```python
+def test_something(db)
+```
+
+👉 “This test needs the `db` fixture”
+
+### Step 2 — fixture starts executing (setup phase)
+
+```python
+print("setup db")
+db = Database()
+```
+
+👉 Resource is created
+
+### Step 3 — pytest hits `yield`
+
+```python
+yield db
+```
+
+👉 Two things happen:
+
+1. The value (`db`) is **returned to the test**
+2. The fixture is **paused (not finished!)**
+
+### Step 4 — test runs
+
+```python
+print("running test")
+```
+
+👉 Test uses the `db` object
+
+### Step 5 — test finishes
+
+Now pytest goes:
+
+> “Okay, resume the fixture”
+
+### Step 6 — fixture resumes AFTER `yield`
+
+```python
+print("teardown db")
+db.close()
+```
+
+👉 Cleanup happens here
+
+# 🧠 Timeline view
+
+```
+Fixture start
+   ↓
+[SETUP]
+   ↓
+yield → hand object to test
+   ↓
+[TEST RUNS]
+   ↓
+resume fixture
+   ↓
+[TEARDOWN]
+   ↓
+fixture ends
+```
+
+# ⚡ Why teardown happens AFTER `yield`
+
+Because:
+
+> Code after `yield` is executed **only after the test is done**
+
+Think of `yield` like:
+
+> “Pause here, come back later”
+
+# 🔁 What if test fails?
+
+Even if this happens:
+
+```python
+def test_something(db):
+    raise Exception("boom")
+```
+
+👉 pytest will STILL:
+
+```
+resume fixture → run teardown
+```
+
+# 💡 This is critical
+
+Without `yield`, you’d leak:
+
+* DB connections
+* files
+* network resources
+* emulator state
+
+# 🆚 Why not just use `return`?
+
+If you do:
+
+```python
+@pytest.fixture
+def db():
+    db = Database()
+    return db
+```
+
+👉 There is **no teardown phase**
+
+Once returned → fixture is done
+
+# 🧪 Multiple fixtures (important behavior)
+
+If you have:
+
+```python
+@pytest.fixture
+def db():
+    print("setup db")
+    yield "db"
+    print("teardown db")
+
+@pytest.fixture
+def user(db):
+    print("setup user")
+    yield "user"
+    print("teardown user")
+```
+
+## Execution order:
+
+```
+setup db
+setup user
+ test runs 
+teardown user
+teardown db
+```
+
+# 🧠 Why reverse order?
+
+Because pytest unwinds like a stack:
+
+> Last setup → first teardown
+
+This prevents dependency issues.
