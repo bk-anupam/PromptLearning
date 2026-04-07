@@ -366,6 +366,327 @@ In Python, an `async def` function doesn't return a "Promise" like in JS. It ret
 * Think of a Coroutine as a "Paused Function" that knows exactly where it left off.
 * When you `await` it, Python uses a generator-like mechanism to "yield" control back to the `asyncio` event loop.
 
+To understand a **Coroutine Object**, you have to look at it as a "Function with a Memory."
+
+In a normal function, once it starts, it runs until it hits a `return` or the end. A Coroutine is a specialized object that can **pause** its execution, save its entire local state (variables, next line to run), and then **resume** exactly where it left off later.
+
+When you define a function with `async def`, calling it doesn't actually run the code. Instead, it returns a **Coroutine Object**. This object is essentially a **State Machine**. It sits there, idle, until an Event Loop (like `asyncio`) decides to "drive" it forward.
+
+## How the Mechanism Works (Step-by-Step)
+
+When you write:
+
+```python
+data = await fetch_data()
+```
+
+What *actually happens* is:
+
+1. Your function **pauses**
+2. The event loop says:
+   👉 “Cool, I’ll come back when this is ready”
+3. Something in the system (OS / timer / thread) finishes the work
+4. The event loop **gets notified**
+5. Your function **resumes exactly where it paused**
+
+Now let’s break the internal machinery.
+
+---
+
+## ⚙️ 1. The Selector (The “Notification System”)
+
+### 🔹 What problem does it solve?
+
+👉 “How does Python know when something is ready?”
+
+Instead of constantly checking (wasteful), Python uses the OS.
+
+---
+### 🔹 What is a Selector?
+
+👉 A **Selector = OS-level watcher of I/O events**
+On each iteration, the event loop asks the selector: "Any news?" The selector hands back a list of completed tasks.
+
+Examples of selectors:
+* Linux → `epoll`
+* Mac → `kqueue`
+
+---
+
+### 🔹 Real Flow
+
+#### Step 1 — Registration
+
+When you do:
+
+```python
+await socket.recv()
+```
+
+Python tells OS:
+
+👉 “Hey OS, watch this connection. Tell me when data arrives.”
+
+#### Step 2 — OS waits (not Python)
+
+Python is NOT polling.
+The OS is doing:
+👉 “I’ll wake you when ready”
+
+#### Step 3 — OS sends signal
+
+When data arrives:
+
+👉 OS marks file descriptor as **READY**
+
+#### Step 4 — Event loop checks selector
+
+On next loop iteration:
+
+```python
+selector.select()
+```
+
+👉 Returns: “These tasks are ready”
+
+---
+### 🔥 Key Insight
+
+👉 Python doesn’t detect completion
+👉 **OS tells Python when something is ready**
+
+This is a big difference from how people *imagine* async works.
+
+---
+# ⚙️ 2. The Ready Queue (`_ready`)
+
+Now comes the next piece.
+
+👉 “Okay, something is ready — now what?”
+
+### 🔹 What is `_ready`?
+
+👉 A queue of **tasks ready to run RIGHT NOW**
+
+### 🔹 Flow
+
+#### Step 1 — Every async Task is wrapped in Future
+
+```python
+future = Future()
+```
+
+👉 Think: placeholder for result
+
+#### Step 2 — Work completes
+
+When OS signals background task completion, the event loop calls :
+
+```python
+future.set_result(data)
+```
+
+#### Step 3 — Task gets scheduled
+
+Setting the result in the future automatically triggers a "step" function that adds the coroutine back into the loop's **`_ready` queue**.:
+
+```python
+_ready.append(task)
+```
+
+#### Step 4 — Event loop executes it
+
+```python
+task.send(result)
+```
+
+👉 This resumes your function exactly after `await`
+
+---
+
+### 🔥 Key Insight
+
+👉 `_ready` = Python’s version of JS task queue
+👉 But instead of being “pushed externally” → it’s internally scheduled
+
+---
+
+# ⚙️ 3. Different Types of Async Tasks
+
+This is where things get interesting.
+Not all async tasks are the same.
+
+### 🟢 Case 1 — Network I/O
+
+#### Where it runs:
+
+👉 OS kernel
+
+#### How it completes:
+
+👉 File descriptor becomes READY
+
+#### Flow:
+
+```
+OS → Selector → Event Loop → _ready queue → resume coroutine
+```
+
+### 🟡 Case 2 — `asyncio.sleep()`
+
+#### Where it runs:
+
+👉 Inside event loop (no OS)
+
+#### Flow:
+
+```python
+await asyncio.sleep(2)
+```
+
+1. Event loop stores:
+
+   ```
+   wake_time = now + 2
+   ```
+2. Puts task in `_scheduled` queue
+3. Each loop tick checks:
+
+   ```
+   is time reached?
+   ```
+4. If yes → moves to `_ready`
+
+### 🔴 Case 3 — Threaded Tasks (Blocking work)
+
+Example:
+
+```python
+await loop.run_in_executor(...)
+```
+
+#### Where it runs:
+
+👉 Separate thread
+
+#### How it signals completion:
+
+👉 Uses **self-pipe trick**
+
+* Thread writes 1 byte to a pipe
+* Event loop is watching that pipe
+* Pipe becomes readable → selector wakes up
+
+---
+### 🔥 Key Insight
+
+Different async tasks = different wake-up mechanisms
+
+| Type    | Who wakes the loop |
+| ------- | ------------------ |
+| Network | OS                 |
+| sleep   | Event loop         |
+| thread  | pipe signal        |
+
+---
+
+# 🔄 Putting It All Together (Full Flow)
+
+Let’s trace this:
+
+```python
+async def main():
+    data = await fetch()
+    print(data)
+```
+
+#### Step-by-step:
+
+#### 1. Coroutine starts
+
+```python
+main()
+```
+
+#### 2. Hits `await fetch()`
+
+👉 Pauses
+👉 Registers with selector
+👉 Returns control to event loop
+
+#### 3. Event loop runs other tasks
+
+#### 4. Data arrives
+
+👉 OS signals selector
+#### 5. Event loop wakes up
+
+```python
+selector.select()
+```
+
+Returns:
+
+```
+[fetch_task_ready]
+```
+
+#### 6. Future resolved
+
+```python
+future.set_result(data)
+```
+
+#### 7. Task added to `_ready`
+
+#### 8. Event loop runs it
+
+```python
+task.send(data)
+```
+
+#### 9. Your function resumes
+
+```python
+print(data)
+```
+
+---
+
+# ⚖️ Comparison to JavaScript (Now it’ll click)
+
+| Concept       | JavaScript         | Python             |
+| ------------- | ------------------ | ------------------ |
+| Queue         | Task Queue         | `_ready`           |
+| Async handler | Browser/Node       | OS + Selector      |
+| Notification  | Environment pushes | Loop pulls from OS |
+| Promise       | Promise            | Future             |
+
+---
+
+### 🔥 The Core Difference
+
+👉 JS:
+
+> “Environment pushes callback into queue”
+
+👉 Python:
+
+> “Event loop asks OS what’s ready, then schedules it”
+
+
+---
+
+# 🧠 Final Mental Model (This is the one to remember)
+
+👉 Event loop is NOT doing the work
+
+It is:
+
+1. Asking OS: “anything ready?”
+2. Moving ready tasks → `_ready`
+3. Executing them
+
 
 ---
 # ❗ Is Event Loop tied to UI?
